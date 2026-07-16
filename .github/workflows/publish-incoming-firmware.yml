@@ -1,0 +1,94 @@
+name: Publish incoming firmware
+
+on:
+  push:
+    branches:
+      - incoming/**
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Validate and publish signed firmware
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out submitted release
+        uses: actions/checkout@v5
+
+      - name: Validate release envelope and artifacts
+        id: release
+        run: |
+          set -euo pipefail
+          directory="incoming"
+          metadata="$directory/release.json"
+          manifest="$directory/garden-firmware-xiao-esp32c6.manifest.json"
+          image="$directory/garden-firmware-xiao-esp32c6.bin"
+          full_image="$directory/garden-firmware-xiao-esp32c6-full-0x0.bin"
+
+          test -f "$metadata"
+          test -f "$manifest"
+          test -f "$image"
+          test -f "$full_image"
+          test -f "$directory/FLASHING.md"
+
+          test "$(jq -r '.schema' "$metadata")" = "garden-firmware-release/v1"
+          tag="$(jq -r '.tag' "$metadata")"
+          channel="$(jq -r '.channel' "$metadata")"
+          source_sha="$(jq -r '.source_sha' "$metadata")"
+          test "$tag" = "${GITHUB_REF_NAME#incoming/}"
+          [[ "$tag" =~ ^firmware-(stable|beta)-[0-9a-f]{12}$ ]]
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
+          test "$tag" = "firmware-$channel-${source_sha:0:12}"
+          [[ "$channel" == "stable" || "$channel" == "beta" ]]
+
+          test "$(jq -r '.schema' "$manifest")" = "garden-ota-manifest/v1"
+          test "$(jq -r '.board' "$manifest")" = "xiao-esp32c6"
+          test "$(jq -r '.chip' "$manifest")" = "esp32c6"
+          test "$(jq -r '.channel' "$manifest")" = "$channel"
+          test "$(jq -r '.provisioning_required' "$manifest")" = "true"
+          test "$(jq -r '.image.file' "$manifest")" = "$(basename "$image")"
+          test "$(jq -r '.image.size_bytes' "$manifest")" = "$(wc -c < "$image" | tr -d ' ')"
+          test "$(jq -r '.image.sha256' "$manifest")" = "$(sha256sum "$image" | awk '{print $1}')"
+          test "$(wc -c < "$full_image" | tr -d ' ')" = "4194304"
+          test "$(jq -r '.signature.algorithm' "$manifest")" = "ecdsa-p256-sha256"
+          test "$(jq -r '.signature.format' "$manifest")" = "raw-r-s-hex"
+          [[ "$(jq -r '.signature.value' "$manifest")" =~ ^[0-9a-f]{128}$ ]]
+
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'channel=%s\n' "$channel" >> "$GITHUB_OUTPUT"
+          printf 'source_sha=%s\n' "$source_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Create immutable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          CHANNEL: ${{ steps.release.outputs.channel }}
+          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
+        run: |
+          arguments=(
+            "$TAG"
+            incoming/garden-firmware-xiao-esp32c6.bin
+            incoming/garden-firmware-xiao-esp32c6-full-0x0.bin
+            incoming/garden-firmware-xiao-esp32c6.manifest.json
+            incoming/FLASHING.md
+            --target main
+            --title "Garden firmware $CHANNEL ${SOURCE_SHA:0:12}"
+            --notes "Signed XIAO ESP32-C6 firmware generated from source commit $SOURCE_SHA."
+          )
+          if [[ "$CHANNEL" == "stable" ]]; then
+            arguments+=(--latest)
+          else
+            arguments+=(--prerelease)
+          fi
+          gh release create "${arguments[@]}"
+
+      - name: Remove processed submission branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$GITHUB_REF_NAME"
